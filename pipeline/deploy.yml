@@ -1,0 +1,252 @@
+parameters:
+- name: serviceConnection
+  type: string  
+- name: environment
+  type: string  
+- name: environmentName
+  type: string
+- name: variableGroup
+  type: string
+
+stages:
+  - stage: Deploy_${{ parameters.environmentName }}
+    displayName: Deploy ${{ parameters.environmentName }}
+
+    variables:
+    - group: ${{ parameters.variableGroup }}
+    - name: foo
+      value: contoso # triggers elseif condition
+
+    jobs:
+    - deployment: Deploy_${{ parameters.environmentName }}
+      displayName: ${{ parameters.environmentName }} environment
+      environment: ${{ parameters.environment }}
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+        
+            - checkout: self
+              lfs: false
+              fetchDepth: 1
+              persistCredentials: true
+
+            - task: TerraformInstaller@0
+              displayName: 'Terraform : Install latest version'
+              inputs:
+                terraformVersion: 'latest'
+            
+            - task: TerraformTaskV3@3
+              displayName: 'Terraform : Init'
+              inputs:
+                provider: 'azurerm'
+                command: 'init'
+                workingDirectory: '$(System.DefaultWorkingDirectory)/infra'
+                backendServiceArm: ${{ parameters.serviceConnection }}
+                backendAzureRmResourceGroupName: $(terraform.stateFile.resourceGroup.name)
+                backendAzureRmStorageAccountName: $(terraform.stateFile.storageAccount.name)
+                backendAzureRmContainerName: $(terraform.stateFile.container.name)
+                backendAzureRmKey: $(terraform.stateFile.name)
+
+            - task: PowerShell@2
+              displayName: 'Terraform : Check if resource group is already managed in state'
+              inputs:
+                targetType: 'inline'
+                script: |
+                  $rgIsManaged = (((terraform state list) | where { $_ -eq 'azurerm_resource_group.rg' }) -ne $null)
+                  if ($rgIsManaged) {
+                    Write-Host "It is!"
+                  } else {
+                    Write-Host "It is not!"
+                  }
+                  echo "##vso[task.setvariable variable=rgIsManaged]$rgIsManaged"
+                workingDirectory: '$(System.DefaultWorkingDirectory)/infra'
+
+            - task: TerraformTaskV3@3
+              displayName: 'Terraform : Import resource group'
+              condition: and ( succeeded(), eq( variables.rgIsManaged, false ) )
+              inputs:
+                provider: 'azurerm'
+                command: 'custom'
+                customCommand: 'import'
+                commandOptions: '-var "location=$(terraform.location)" -var "resource_group_name=$(azure.resourceGroup.name)" -var "log_analytics_workspace_name=$(terraform.logAnalyticsWorkspace.name)" -var "application_insights_name=$(terraform.applicationInsights.name)" -var "application_insights_application_type=$(terraform.applicationInsights.applicationType)" -var "storage_account_name=$(terraform.storageAccount.name)" -var "storage_account_container_name=$(terraform.storageAccount.container.name)" -var "managed_environment_name=$(terraform.containerAppEnvironment.name)" -var "managed_environment_subnet_id=$(terraform.containerAppEnvironment.subnet.id)" -var "postgresql_server_name=$(terraform.postgresqlServer.name)" -var "postgresql_server_administrator_login=$(terraform.postgresqlServer.administratorLogin)" -var "postgresql_server_administrator_password=$(terraform.postgresqlServer.administratorPassword)" -var "postgresql_server_sku=$(terraform.postgresqlServer.sku)" -var "postgresql_server_delegated_subnet_id=$(terraform.postgresqlServer.delegatedSubnet.id)" -var "postgresql_server_private_dns_zone_id=$(terraform.postgresqlServer.privateDNSzone.id)" -var "container_registry_name=$(terraform.containerRegistry.name)" -var "container_registry_sku=$(terraform.containerRegistry.sku)" -var "container_registry_admin_enabled=$(terraform.containerRegistry.adminEnabled)" azurerm_resource_group.rg "/subscriptions/$(azure.subscription.id)/resourceGroups/$(azure.resourceGroup.name)"'
+                outputTo: 'console'
+                environmentServiceNameAzureRM: ${{ parameters.serviceConnection }}
+                workingDirectory: '$(System.DefaultWorkingDirectory)/infra'
+
+            - task: TerraformTaskV3@3
+              displayName: 'Terraform : Validate and Apply'
+              inputs:
+                provider: 'azurerm'
+                command: 'apply'
+                workingDirectory: '$(System.DefaultWorkingDirectory)/infra'
+                commandOptions: '-var "location=$(terraform.location)" -var "resource_group_name=$(azure.resourceGroup.name)" -var "log_analytics_workspace_name=$(terraform.logAnalyticsWorkspace.name)" -var "application_insights_name=$(terraform.applicationInsights.name)" -var "application_insights_application_type=$(terraform.applicationInsights.applicationType)" -var "storage_account_name=$(terraform.storageAccount.name)" -var "storage_account_container_name=$(terraform.storageAccount.container.name)" -var "managed_environment_name=$(terraform.containerAppEnvironment.name)" -var "managed_environment_subnet_id=$(terraform.containerAppEnvironment.subnet.id)" -var "postgresql_server_name=$(terraform.postgresqlServer.name)" -var "postgresql_server_administrator_login=$(terraform.postgresqlServer.administratorLogin)" -var "postgresql_server_administrator_password=$(terraform.postgresqlServer.administratorPassword)" -var "postgresql_server_sku=$(terraform.postgresqlServer.sku)" -var "postgresql_server_delegated_subnet_id=$(terraform.postgresqlServer.delegatedSubnet.id)" -var "postgresql_server_private_dns_zone_id=$(terraform.postgresqlServer.privateDNSzone.id)" -var "container_registry_name=$(terraform.containerRegistry.name)" -var "container_registry_sku=$(terraform.containerRegistry.sku)" -var "container_registry_admin_enabled=$(terraform.containerRegistry.adminEnabled)"'
+                environmentServiceNameAzureRM: ${{ parameters.serviceConnection }}
+
+            - task: TerraformTaskV3@3
+              displayName: 'Terraform : Get output variables'
+              name: TerraformOutputs
+              inputs:
+                provider: 'azurerm'
+                command: 'output'
+                environmentServiceNameAzureRM: ${{ parameters.serviceConnection }}
+                workingDirectory: '$(System.DefaultWorkingDirectory)/infra'
+
+            - task: PowerShell@2
+              displayName: Set Terraform outputs as variables
+              inputs:
+                targetType: 'inline'
+                script: |
+                  Write-Host "Declaring all Terraform outputs as variables"
+                  $json = (Get-Content $(TerraformOutputs.jsonOutputVariablesPath) | Out-String | ConvertFrom-Json)
+                  
+                  foreach($prop in $json.psobject.properties) {
+                      echo "##vso[task.setvariable variable=$($prop.Name);]$($prop.Value.value)"
+                  }
+
+            - task: AzureCLI@2
+              displayName: 'Build and push image to Azure registry'
+              inputs:
+                azureSubscription: ${{ parameters.serviceConnection }}
+                scriptType: 'pscore'
+                scriptLocation: 'inlineScript'
+                inlineScript: |    
+                  az acr login --name $(azure.containerRegistry.name)
+                  docker build . -f ./Dockerfile -t $(azure.containerRegistry.name)/$(azure.containerRegistry.repository.name):$(Build.BuildId)
+                  docker push $(azure.containerRegistry.name)/$(azure.containerRegistry.repository.name):$(Build.BuildId)
+                workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+            - task: AzureCLI@2
+              displayName: Set new image to container app
+              inputs:
+                azureSubscription: ${{ parameters.serviceConnection }}
+                scriptType: 'pscore'
+                scriptLocation: 'inlineScript'
+                inlineScript: |
+
+                  Write-Host "Installing extension 'containerapp'..."
+
+                  az config set extension.use_dynamic_install=yes_without_prompt
+
+                  az extension add --name containerapp
+
+                  Write-Host "Check if ContainerApp $(azure.containerApp.name) in resource group $(azure.resourceGroup.name) exists..."
+                  
+                  $query = "[?name=='$(azure.containerApp.name)']"
+                  $result = (az containerapp list --resource-group $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --query $query --output json | ConvertFrom-Json)
+
+                  #If it doesn't 
+                  if ($result -eq $null) { 
+
+                    Write-Host "ContainerApp $(azure.containerApp.name) doesn't exists. Creating..."
+
+                    az containerapp create --name $(azure.containerApp.name) --resource-group $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --environment $(terraform.containerAppEnvironment.name) --image $(azure.containerRegistry.name)/$(azure.containerRegistry.repository.name):$(Build.BuildId) --ingress external --target-port $(azure.containerApp.port) --cpu $(azure.containerApp.cpu) --memory $(azure.containerApp.memory) --revisions-mode $(azure.containerApp.revisionMode) --min-replicas $(azure.containerApp.minReplicas) --max-replicas $(azure.containerApp.maxReplicas) --system-assigned --registry-server $(azure.containerRegistry.name) --registry-username $(azure.containerRegistry.user.name) --registry-password $(acr_admin_password)  --secrets "env=$(application.environment)" "keyvault=$(application.keyvault.uri)" "sqlconnstring=$(application.postgresqlServer.connString)" "httpsport=$(application.httpsPort)" "useinmemorydb=$(application.useInMemoryDB)" --env-vars ASPNETCORE_ENVIRONMENT=secretref:env KEYVAULT_ENDPOINT=secretref:keyvault ConnectionStrings__payments=secretref:sqlconnstring https_port=secretref:httpsport UseInMemoryDatabase=secretref:useinmemorydb
+                    
+                    Write-Host "Adding container app to key vault..."
+
+                    $identity = (az containerapp identity show --name $(azure.containerApp.name) --resource-group $(azure.resourceGroup.name) --output json | ConvertFrom-Json)
+
+                    az role assignment create --role Reader --assignee-object-id $identity.principalId --assignee-principal-type ServicePrincipal --scope $(azure.keyvault.id)
+
+                    az keyvault set-policy --name $(azure.keyvault.name) --resource-group $(azure.keyvault.resourceGroup.name) --object-id $identity.principalId --secret-permissions get list
+
+                    # Get the production labeled revision
+                    
+                    $productionRevision = (az containerapp revision list --name $(azure.containerApp.name) --resource-group $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --query "[?properties.active].{Name : name}" --output json | ConvertFrom-Json).Name
+
+                    Write-Host "Setting label 'production' for $(azure.containerApp.name) - Revision: $productionRevision "
+
+                    az containerapp revision label add --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --label production --revision $productionRevision
+                  }
+                  else {
+
+                    Write-Host "ContainerApp $(azure.containerApp.name) does exist. "
+
+                    # Write-Host "Updating secrets..."
+
+                    az containerapp secret set --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --secrets "env=$(application.environment)" "keyvault=$(application.keyvault.uri)" "sqlconnstring=$(application.postgresqlServer.connString)" "httpsport=$(application.httpsPort)" "useinmemorydb=$(application.useInMemoryDB)"
+                  
+                    Write-Host "Removing 'staging' label from $(azure.containerApp.name)..."
+
+                    az containerapp revision label remove --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --label staging
+                  }
+
+                  $suffix = $(Build.BuildId)
+                  $stagingRevision = '$(azure.containerApp.name)--'+$suffix
+
+                  Write-Host "Creating a new revision $stagingRevision in ContainerApp $(azure.containerApp.name)..."
+                  
+                  az containerapp revision copy --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --revision-suffix $suffix --image $(azure.containerRegistry.name)/$(azure.containerRegistry.repository.name):$(Build.BuildId)
+
+                  Write-Host "Setting label 'staging' to new revision $stagingRevision in ContainerApp $(azure.containerApp.name)..."
+
+                  az containerapp revision label add --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --label staging --revision $stagingRevision
+
+            - ${{ if eq( parameters.environmentName, 'DEV' ) }}:
+              - task: AzureCLI@2
+                displayName: 'Swap staging <-> production revisions'
+                inputs:
+                  azureSubscription: ${{ parameters.serviceConnection }}
+                  scriptType: 'pscore'
+                  scriptLocation: 'inlineScript'
+                  inlineScript: |
+              
+                    Write-Host "Swap staging <-> production revisions..."
+                    az containerapp revision label swap --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --source staging --target production
+
+                    Write-Host "Deactivating old revisions..."
+                    $results = (az containerapp revision list --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --query "[?!contains(name, '$(Build.BuildId)')].{Name : name}" --output json | ConvertFrom-Json)
+
+                    foreach ($result in $results) {
+                      $revisionName = $result.Name
+                      Write-Host "Deactivating revision $revisionName"
+
+                      az containerapp revision deactivate --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --revision $revisionName
+                    }
+            
+
+  - ${{ if eq( parameters.environmentName, 'PROD' ) }}:
+    - stage: Swap_Revisions
+      displayName: "Swap Revisions"
+      dependsOn: 
+      - Deploy_${{ parameters.environmentName }}
+
+      variables:
+      - group: ${{ parameters.variableGroup }}
+        
+      jobs:
+      - deployment: ${{ parameters.environmentName }}
+        displayName: Swap Revisions
+        environment: kgo-communications-SWAP_${{ parameters.environmentName }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:  
+
+              - task: AzureCLI@2
+                displayName: Swap staging <-> production revisions
+                inputs:
+                  azureSubscription: ${{ parameters.serviceConnection }}
+                  scriptType: 'pscore'
+                  scriptLocation: 'inlineScript'
+                  inlineScript: |
+
+                    Write-Host "Installing extension 'containerapp'..."
+                    az config set extension.use_dynamic_install=yes_without_prompt
+
+                    az extension add --name containerapp
+                    
+                    Write-Host "Swap staging <-> production revisions..."
+                    az containerapp revision label swap --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --source staging --target production
+
+                    Write-Host "Deactivating old revisions..."
+                    $results = (az containerapp revision list --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --query "[?!contains(name, '$(Build.BuildId)')].{Name : name}" --output json | ConvertFrom-Json)
+
+                    foreach ($result in $results) {
+                      $revisionName = $result.Name
+                      Write-Host "Deactivating revision $revisionName"
+
+                      az containerapp revision deactivate --name $(azure.containerApp.name) --resource-group  $(azure.resourceGroup.name) --subscription '$(azure.subscription.name)' --revision $revisionName
+                    }
+
+              

@@ -1,0 +1,57 @@
+trigger:
+  batch: true # The system waits until the run is completed, then starts another run with all changes that have not yet been built. https://docs.microsoft.com/en-us/azure/devops/pipelines/yaml-schema/trigger?view=azure-pipelines#examples-2
+  branches:
+    include: 
+    - main
+    - develop
+
+pr:
+  branches:
+    include: 
+    - main
+    - develop
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+- name: isMainBuild
+  value: ${{ eq(variables['Build.SourceBranch'], 'refs/heads/main') }}
+- name: isDevelopBuild
+  value: ${{ eq(variables['Build.SourceBranch'], 'refs/heads/development') }}
+- name: isPR
+  value: ${{ eq(variables['Build.Reason'], 'PullRequest') }}  
+- name: isTagBuild
+  value: ${{ startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}  
+# For debugging purposes. Enable it here, or add the var to the build run in AzDevops
+# - name: system.debug
+#   value: true
+
+stages:
+
+# If not a PR => DEV asking for approval
+- ${{ if eq(variables['isPR'], false) }}:
+  - template: deploy.yml
+    parameters:
+      serviceConnection: containerApps-dev-builder
+      environment: containerApps-DEV-NA
+      environmentName: DEV
+      variableGroup: containerApps-DEV
+
+# If source branch is not a PR, and == develop => DEV without approval
+- ${{ if and( eq(variables['isPR'], false), eq(variables['isDevelopBuild'], true) ) }}:
+  - template: deploy.yml
+    parameters:
+      serviceConnection: containerApps-dev-builder
+      environment: containerApps-DEV-NA
+      environmentName: DEV
+      variableGroup: containerApps-DEV
+
+# If source branch is not a PR, and == main => PROD
+- ${{ if and( eq(variables['isPR'], false), or( eq(variables['isMainBuild'], true), eq(variables['isTagBuild'], true) ) ) }}:
+  - template: deploy.yml
+    parameters:
+      serviceConnection: containerApps-prod-builder
+      environment: containerApps-PROD
+      environmentName: PROD
+      variableGroup: containerApps-PROD
